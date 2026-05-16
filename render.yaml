@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ski-touring-api
+    runtime: python
+    plan: free
+    region: frankfurt          # plus proche pour les utilisateurs FR
+    pythonVersion: "3.11"
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn src.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: GITHUB_BRANCH
+        value: main
+      - key: CACHE_TTL_SECONDS
+        value: "21600"          # 6h
