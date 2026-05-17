@@ -3,17 +3,41 @@ Fonctions météo agrégées par lissage spatial sur N grilles proches.
 
 Port direct de src/app.py de ski-touring-live. Aucune réécriture, pour
 garantir que les scores sortis matchent exactement ceux du Streamlit.
+
+OPTIMISATION : on cache les résultats par cellule de ~10km × jour. Sur
+1700 itinéraires d'un même massif, beaucoup tombent dans la même cellule
+cache — gain typique 10-20× sur le temps total de scoring.
 """
 
 from __future__ import annotations
 
 from datetime import date
+from functools import lru_cache
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 from .data_loader import DataBundle
+
+
+# ─── Cache spatial : on arrondit lat/lon à 0.1° (~10 km en latitude Alpes) ─
+
+def _spatial_key(lat: float, lon: float) -> tuple[int, int]:
+    """Clé de cellule cache : multiplie par 10 et arrondit → ~0.1°."""
+    return (round(lat * 10), round(lon * 10))
+
+
+# Cache global. Vidé manuellement quand le bundle data est rechargé
+# (cf. data_loader.force_reload).
+_meteo_cache: dict[tuple, dict] = {}
+_features_cache: dict[tuple, Optional[dict]] = {}
+
+
+def clear_meteo_caches() -> None:
+    """À appeler après un reload des données pour éviter les valeurs stales."""
+    _meteo_cache.clear()
+    _features_cache.clear()
 
 
 def get_weather_icon(meteo: dict) -> str:
@@ -47,7 +71,23 @@ def get_physical_features(
     target_date: date,
     n_neighbors: int = 5,
 ) -> Optional[dict]:
-    """Features 7j lissées sur N grilles voisines."""
+    """Features 7j lissées sur N grilles voisines, avec cache spatial."""
+    cache_key = (_spatial_key(lat, lon), target_date.toordinal(), n_neighbors)
+    if cache_key in _features_cache:
+        return _features_cache[cache_key]
+
+    result = _get_physical_features_impl(bundle, lat, lon, target_date, n_neighbors)
+    _features_cache[cache_key] = result
+    return result
+
+
+def _get_physical_features_impl(
+    bundle: DataBundle,
+    lat: float,
+    lon: float,
+    target_date: date,
+    n_neighbors: int,
+) -> Optional[dict]:
     grid = bundle.grid_lookup
     df_meteo = bundle.df_meteo
 
@@ -114,11 +154,27 @@ def get_meteo_agg(
     target_date: Optional[date] = None,
     n_neighbors: int = 3,
 ) -> dict:
-    """Météo agrégée pour une journée donnée."""
+    """Météo agrégée pour une journée donnée, avec cache spatial."""
     if target_date is None:
         from datetime import datetime
         target_date = datetime.today().date()
 
+    cache_key = (_spatial_key(lat, lon), target_date.toordinal(), n_neighbors)
+    if cache_key in _meteo_cache:
+        return _meteo_cache[cache_key]
+
+    result = _get_meteo_agg_impl(bundle, lat, lon, target_date, n_neighbors)
+    _meteo_cache[cache_key] = result
+    return result
+
+
+def _get_meteo_agg_impl(
+    bundle: DataBundle,
+    lat: float,
+    lon: float,
+    target_date: date,
+    n_neighbors: int,
+) -> dict:
     grid = bundle.grid_lookup
     df_meteo = bundle.df_meteo
 

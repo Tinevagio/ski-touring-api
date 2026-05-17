@@ -110,7 +110,7 @@ def compute_base_snow_score_boosted(
         "massif": features.get("massif", "MONT-BLANC"),
         "day_of_week": date_sortie.weekday(),
     }])
-    input_data["massif"] = input_data["massif"].astype("category")
+    input_data.loc[:, "massif"] = input_data["massif"].astype("category")
 
     score = bundle.ski_model.predict(input_data)[0]
     normalized = float(np.clip((score + 1) / 2, 0, 1))

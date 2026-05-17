@@ -82,6 +82,12 @@ def get_bundle() -> DataBundle:
             return _bundle
         log.info("Loading data bundle from GitHub (TTL expired or first load)…")
         _bundle = _load_from_remote()
+        # Invalide les caches dérivés en aval (météo agrégée par cellule).
+        try:
+            from .meteo import clear_meteo_caches
+            clear_meteo_caches()
+        except Exception:
+            pass
         log.info(
             "Bundle loaded: %d itinéraires, %d massifs BERA, %d points météo",
             len(_bundle.df_itin),
@@ -96,6 +102,12 @@ def force_reload() -> DataBundle:
     global _bundle
     with _lock:
         _bundle = _load_from_remote()
+        # Invalide les caches dérivés (météo / features par cellule)
+        try:
+            from .meteo import clear_meteo_caches
+            clear_meteo_caches()
+        except Exception:
+            pass
         return _bundle
 
 

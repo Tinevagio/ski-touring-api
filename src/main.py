@@ -200,6 +200,7 @@ def ideas(
             )
 
     # ── Filtrage ───────────────────────────────────────────────────────────
+    t0 = time.time()
     df = bundle.df_itin
     df_filtered = df[
         df["denivele_positif"].between(dplus_min, dplus_max)
@@ -209,6 +210,8 @@ def ideas(
         df_filtered = df_filtered[df_filtered["massif"].isin(massifs_list)]
 
     n_filtered = len(df_filtered)
+    log.info("[perf] /ideas: %d itinéraires filtrés en %.2fs",
+             n_filtered, time.time() - t0)
     if n_filtered == 0:
         return IdeasResponse(
             date=target_date.isoformat(),
@@ -225,10 +228,13 @@ def ideas(
         )
 
     # ── Scoring v3 (fitness/danger) ────────────────────────────────────────
+    t0 = time.time()
     df_filtered["score"] = df_filtered.apply(
         lambda row: scoring_v3(bundle, row, niveau, dplus_min, dplus_max, target_date),
         axis=1,
     )
+    log.info("[perf] /ideas: scoring_v3 sur %d lignes en %.2fs",
+             n_filtered, time.time() - t0)
     top = df_filtered.sort_values("score", ascending=False).head(n_results).copy()
 
     # ── Météo globale + alertes de la journée ──────────────────────────────
@@ -253,6 +259,7 @@ def ideas(
             alerts.append("💨 Vent fort (40+ km/h) → Attention aux crêtes")
 
     # ── Construction de la réponse ─────────────────────────────────────────
+    t0 = time.time()
     ideas_out: list[Idea] = []
     for _, row in top.iterrows():
         meteo = get_meteo_agg(bundle, row["lat"], row["lon"], target_date)
@@ -327,6 +334,9 @@ def ideas(
             **ai_payload,
         ))
 
+    log.info("[perf] /ideas: construction réponse (n=%d, ai=%s) en %.2fs",
+             len(ideas_out), include_ai, time.time() - t0)
+
     return IdeasResponse(
         date=target_date.isoformat(),
         saison=_saison_label(target_date),
@@ -359,3 +369,16 @@ def _is_null(v) -> bool:
         return pd.isna(v)
     except (TypeError, ValueError):
         return v is None
+
+
+# ─── Lancement local / fallback ──────────────────────────────────────────────
+# Permet de démarrer le service avec `python -m src.main` en cas de problème
+# avec la start command. Force host=0.0.0.0 (obligatoire sur Render) et lit
+# le port depuis l'env $PORT (avec fallback 8000 pour le local).
+if __name__ == "__main__":
+    import os
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "8000"))
+    log.info("Starting uvicorn on 0.0.0.0:%d", port)
+    uvicorn.run("src.main:app", host="0.0.0.0", port=port, reload=False)
