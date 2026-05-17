@@ -41,6 +41,7 @@ URL_BERA      = f"{_BASE_URL}/data/bera_latest.csv"
 URL_METEO     = f"{_BASE_URL}/data/meteo_cache.parquet"
 URL_ITIN      = f"{_BASE_URL}/data/raw/itineraires_alpes_camptocamp.csv"
 URL_MODEL     = f"{_BASE_URL}/models/skiability_regression_physical.txt"
+URL_TRAIN_DS  = f"{_BASE_URL}/data/skitour_ml_dataset_openmeteo.csv"
 
 # ─── Cache en mémoire ───────────────────────────────────────────────────────
 
@@ -56,6 +57,12 @@ class DataBundle:
     df_meteo: pd.DataFrame          # météo horaire toutes grilles
     grid_lookup: pd.DataFrame       # latitudes/longitudes uniques (pour kNN)
     ski_model: Optional[lgb.Booster]
+    # Catégories de massifs exactement dans l'ordre du training, pour aligner
+    # pd.Categorical lors de l'inférence LightGBM (sinon "categorical_feature
+    # do not match").
+    massif_categories: list[str]
+    # Mapping CSV-normalisé → nom training. Ex: "BEAUFORTAIN" → "Beaufortain"
+    massif_csv_to_train: dict[str, str]
     fetched_at: float               # timestamp de chargement
 
 
@@ -187,6 +194,33 @@ def _load_from_remote() -> DataBundle:
     except Exception as e:
         log.warning("Failed to load LightGBM model, AI scoring disabled: %s", e)
 
+    # ── Catégories massif du training (pour aligner LightGBM) ──────────────
+    # On fetch le dataset d'entraînement uniquement pour récupérer la liste
+    # exacte des massifs et leur ordre d'apparition — c'est ce que LightGBM
+    # attend en inférence. Sans ça, les noms en majuscules du CSV
+    # itinéraires (BEAUFORTAIN) ne matchent pas avec ceux du training
+    # (Beaufortain), et le score IA tombe à NaN.
+    massif_categories: list[str] = []
+    massif_csv_to_train: dict[str, str] = {}
+    try:
+        train_bytes = _http_get(URL_TRAIN_DS)
+        df_train = pd.read_csv(io.BytesIO(train_bytes), usecols=["massif"])
+        # Ordre d'apparition exact, sans dédoublonnage du DataFrame (drop_duplicates
+        # conserve l'ordre d'apparition).
+        massif_categories = df_train["massif"].drop_duplicates().tolist()
+        # Mapping CSV → nom training. On filtre les massifs hors France
+        # (Norvège, Argentine, etc.) qui n'ont pas de clé dans le mapping.
+        for train_name in massif_categories:
+            key = _normalize_massif(train_name)
+            if key:
+                massif_csv_to_train[key] = train_name
+        log.info(
+            "Loaded %d massif categories from training dataset (%d in CSV mapping)",
+            len(massif_categories), len(massif_csv_to_train),
+        )
+    except Exception as e:
+        log.warning("Failed to load training dataset for AI categories: %s", e)
+
     return DataBundle(
         df_itin=df_itin,
         df_bera=df_bera,
@@ -194,5 +228,67 @@ def _load_from_remote() -> DataBundle:
         df_meteo=df_meteo,
         grid_lookup=unique_grids,
         ski_model=ski_model,
+        massif_categories=massif_categories,
+        massif_csv_to_train=massif_csv_to_train,
         fetched_at=time.time(),
     )
+
+
+def _normalize_massif(name: str) -> str:
+    """
+    Normalise un nom de massif pour mapping CSV ↔ training.
+    On utilise un mapping explicite parce que la correspondance n'est pas
+    mécanique (ex: 'Bornes - Aravis' côté training = 'ARAVIS' côté CSV).
+    """
+    # Mapping explicite : nom training → nom CSV. On inverse en sortie.
+    train_to_csv = {
+        'Vanoise': 'VANOISE',
+        'Belledonne': 'BELLEDONNE',
+        'Mont Blanc': 'MONT-BLANC',
+        'Ecrins': 'ECRINS',
+        'Vosges': 'VOSGES',
+        'Alpes Grées S': 'ALPES-GREES-S',
+        'Alpes Grées N': 'ALPES-GREES-N',
+        'Grandes Rousses - Arves': 'GRANDES-ROUSSES',
+        'Ubaye - Parpaillon - Alpes Cozie S': 'UBAYE',
+        'Queyras - Alpes Cozie N': 'QUEYRAS',
+        'Cerces - Thabor - Mont Cenis': 'THABOR',
+        'Haut Giffre - Aiguilles Rouges': 'HAUT-GIFFRE',
+        'Valais E - Alpes Pennines E': 'VALAIS-E',
+        'Valais W - Alpes Pennines W': 'VALAIS-W',
+        'Bornes - Aravis': 'ARAVIS',
+        'Beaufortain': 'BEAUFORTAIN',
+        'Chartreuse': 'CHARTREUSE',
+        'Andorre - Ariège': 'ANDORRE',
+        'Grand Paradis': 'GRAND-PARADIS',
+        'Préalpes de Digne': 'PREALPES-DE-DIGNE',
+        'Mercantour - Alpes Maritimes Italiennes': 'MERCANTOUR',
+        'Taillefer - Matheysine': 'TAILLEFER',
+        'Lauzière - Cheval Noir': 'LAUZIERE',
+        'Préalpes de provence': 'PREALPES-DE-PROVENCE',
+        'Devoluy': 'DEVOLUY',
+        'Bauges': 'BAUGES',
+        'Chablais - Faucigny': 'CHABLAIS',
+        'Vercors': 'VERCORS',
+        # Massifs hors France (très peu d'itinéraires CSV concernés)
+        'Mont-Perdu - Gavarnie - Bigorre': 'MONT-PERDU',
+        'Préalpes Fribourgeoises / Bernoises': 'PREALPES-FRIBOURGEOISES',
+        'Cerdagne - Capcir - Conflent': 'CERDAGNE',
+        'Luchon - Posets - Maladeta': 'LUCHON',
+        'Alpes Bernoises E': 'ALPES-BERNOISES-E',
+        'Alpes Bernoises W': 'ALPES-BERNOISES-W',
+        'Alpes Vaudoises': 'ALPES-VAUDOISES',
+        'Engadine': 'ENGADINE',
+        'Silvretta': 'SILVRETTA',
+        'Tessin E - Adula - Grisons': 'TESSIN-E',
+        'Tessin W - Conches': 'TESSIN-W',
+        'Alpes Glaronaises': 'ALPES-GLARONAISES',
+        'Ortles': 'ORTLES',
+        'Hohe Tauern': 'HOHE-TAUERN',
+        'Stubai': 'STUBAI',
+        'Ötztal': 'OETZTAL',
+        'Vorarlberg Allgau': 'VORARLBERG',
+        'Massif Central': 'MASSIF-CENTRAL',
+        'Préalpes de Grasse': 'PREALPES-DE-GRASSE',
+    }
+    return train_to_csv.get(name, "")

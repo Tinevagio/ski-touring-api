@@ -93,9 +93,27 @@ def compute_spring_snow_score(features: dict) -> float:
 def compute_base_snow_score_boosted(
     bundle: DataBundle, features: dict, date_sortie: date
 ) -> float:
-    """Score hiver IA avec correction biais avalanche."""
+    """Score hiver IA avec correction biais avalanche.
+
+    Important : LightGBM exige que la colonne `massif` ait EXACTEMENT les
+    mêmes catégories (et dans le même ordre) que lors de l'entraînement.
+    On utilise donc `bundle.massif_categories` pour construire le
+    pd.Categorical avec le bon vocabulaire.
+    """
     if bundle.ski_model is None:
         return 0.5
+
+    # Mapping du nom CSV vers le nom training. Si inconnu, on tombe sur un
+    # massif par défaut connu ("Mont Blanc") plutôt que de faire planter.
+    csv_massif = str(features.get("massif", "MONT-BLANC")).strip().upper()
+    train_massif = bundle.massif_csv_to_train.get(csv_massif)
+    if train_massif is None:
+        # Fallback : pas de mapping connu pour ce CSV-massif. On choisit un
+        # nom training présent dans les catégories pour éviter le crash.
+        if bundle.massif_categories:
+            train_massif = bundle.massif_categories[0]
+        else:
+            return 0.5
 
     input_data = pd.DataFrame([{
         "temp_min_7d_avg": features["temp_min_7d_avg"],
@@ -107,10 +125,19 @@ def compute_base_snow_score_boosted(
         "summit_altitude_clean": features.get("summit_altitude_clean", 2400),
         "topo_denivele": features.get("topo_denivele", 1200),
         "topo_difficulty": features.get("topo_difficulty", 3),
-        "massif": features.get("massif", "MONT-BLANC"),
+        "massif": train_massif,
         "day_of_week": date_sortie.weekday(),
     }])
-    input_data.loc[:, "massif"] = input_data["massif"].astype("category")
+    # Cast vers Categorical avec EXACTEMENT les catégories du training, dans
+    # le même ordre. Sans ça, LightGBM voit une catégorie unique avec le
+    # code 0, qui ne correspond à rien dans son vocabulaire interne.
+    if bundle.massif_categories:
+        input_data["massif"] = pd.Categorical(
+            input_data["massif"],
+            categories=bundle.massif_categories,
+        )
+    else:
+        input_data["massif"] = input_data["massif"].astype("category")
 
     score = bundle.ski_model.predict(input_data)[0]
     normalized = float(np.clip((score + 1) / 2, 0, 1))
