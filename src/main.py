@@ -57,6 +57,22 @@ app.add_middleware(
 )
 
 
+# Handler global pour les 500 : on log le traceback complet côté serveur
+# (sinon Render n'affiche qu'un "Internal Server Error" générique côté client
+# sans info utile). Important pour le diagnostic.
+@app.exception_handler(Exception)
+async def _unhandled(request, exc):
+    import traceback
+    from fastapi.responses import JSONResponse
+    tb = traceback.format_exc()
+    log.error("Unhandled exception on %s %s:\n%s",
+              request.method, request.url.path, tb)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal error: {type(exc).__name__}: {exc}"},
+    )
+
+
 # ─── /health ─────────────────────────────────────────────────────────────────
 
 
@@ -281,35 +297,48 @@ def ideas(
         features_detail: Optional[FeaturesDetail] = None
         if include_ai and bundle.ski_model is not None:
             from .meteo import get_physical_features
-            feat = get_physical_features(bundle, row["lat"], row["lon"], target_date)
-            if feat is not None:
-                feat["summit_altitude_clean"] = float(row.get("alt_sommet", 2500))
-                feat["topo_denivele"] = float(row["denivele_positif"])
-                feat["topo_difficulty"] = 3
-                feat["massif"] = row["massif"]
-                hybrid, base, spring, saison = ai_scoring.compute_hybrid_snow_score(
-                    bundle, feat, target_date
+            try:
+                feat = get_physical_features(bundle, row["lat"], row["lon"], target_date)
+                if feat is not None:
+                    # pd.Series.get() existe mais retourne pd.NA sur clé absente,
+                    # ce qui fait planter float(). On lit avec un fallback safe.
+                    alt = _safe_float(row, "alt_sommet", default=2500.0)
+                    feat["summit_altitude_clean"] = alt
+                    feat["topo_denivele"] = _safe_float(row, "denivele_positif", default=1200.0)
+                    feat["topo_difficulty"] = 3
+                    feat["massif"] = str(row["massif"])
+                    hybrid, base, spring, saison = ai_scoring.compute_hybrid_snow_score(
+                        bundle, feat, target_date
+                    )
+                    note_10 = round(hybrid * 10, 1)
+                    picto, qualite, color = ai_scoring.quality_label(note_10)
+                    ai_payload = {
+                        "ai_snow_score": float(hybrid),
+                        "ai_note_10": float(note_10),
+                        "ai_qualite": qualite,
+                        "ai_picto": picto,
+                        "ai_color": color,
+                        "ai_saison_mode": saison,
+                    }
+                    features_detail = FeaturesDetail(
+                        temp_min_7d_avg=feat["temp_min_7d_avg"],
+                        temp_max_7d_avg=feat["temp_max_7d_avg"],
+                        temp_amp_7d_avg=feat["temp_amp_7d_avg"],
+                        snowfall_7d_sum=feat["snowfall_7d_sum"],
+                        wind_max_7d=feat["wind_max_7d"],
+                        freeze_thaw_cycles_7d=int(feat["freeze_thaw_cycles_7d"]),
+                        spring_score=float(spring),
+                        base_score=float(base),
+                    )
+            except Exception as e:
+                # On ne casse pas la requête si l'IA plante sur un itinéraire.
+                # On log et on continue : la card sera affichée sans score IA.
+                log.warning(
+                    "[ideas] AI scoring failed for %s (%s): %s",
+                    row.get("name", "?"), row.get("massif", "?"), e,
                 )
-                note_10 = round(hybrid * 10, 1)
-                picto, qualite, color = ai_scoring.quality_label(note_10)
-                ai_payload = {
-                    "ai_snow_score": float(hybrid),
-                    "ai_note_10": float(note_10),
-                    "ai_qualite": qualite,
-                    "ai_picto": picto,
-                    "ai_color": color,
-                    "ai_saison_mode": saison,
-                }
-                features_detail = FeaturesDetail(
-                    temp_min_7d_avg=feat["temp_min_7d_avg"],
-                    temp_max_7d_avg=feat["temp_max_7d_avg"],
-                    temp_amp_7d_avg=feat["temp_amp_7d_avg"],
-                    snowfall_7d_sum=feat["snowfall_7d_sum"],
-                    wind_max_7d=feat["wind_max_7d"],
-                    freeze_thaw_cycles_7d=int(feat["freeze_thaw_cycles_7d"]),
-                    spring_score=float(spring),
-                    base_score=float(base),
-                )
+                ai_payload = {}
+                features_detail = None
 
         ideas_out.append(Idea(
             name=str(row["name"]),
@@ -369,6 +398,27 @@ def _is_null(v) -> bool:
         return pd.isna(v)
     except (TypeError, ValueError):
         return v is None
+
+
+def _safe_float(row, col: str, *, default: float) -> float:
+    """
+    Lit row[col] en float avec fallback robuste.
+    - Si la colonne n'existe pas : retourne default.
+    - Si la valeur est NaN/None/non castable : retourne default.
+    `row` peut être un dict ou une pd.Series.
+    """
+    try:
+        if col not in row:
+            return default
+        v = row[col]
+    except Exception:
+        return default
+    if _is_null(v):
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
 
 
 # ─── Lancement local / fallback ──────────────────────────────────────────────
